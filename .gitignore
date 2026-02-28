@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+
+# Environment
+.env
+
+# Database
+*.db
+
+# Generated files
+hello_world.py
+/tmp/
+
+# Test / build cache
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
