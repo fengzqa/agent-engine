@@ -45,8 +45,17 @@ class WorkflowRunner:
 
     # ── Public API ───────────────────────────────────────────────────────────
 
-    async def run(self, definition: WorkflowDefinition) -> tuple[WorkflowInstance, Tracer]:
+    async def run(
+        self,
+        definition: WorkflowDefinition,
+        instance_id: str | None = None,
+    ) -> tuple[WorkflowInstance, Tracer]:
         """Create a new workflow instance and execute it from scratch.
+
+        Args:
+            definition:  The workflow to execute.
+            instance_id: Optional pre-assigned ID (used by the API layer so
+                         callers can poll status before execution begins).
 
         Returns:
             (instance, tracer) — tracer holds spans and token usage for this run.
@@ -54,11 +63,14 @@ class WorkflowRunner:
         tracer = self.tracer or Tracer()
         set_trace_id(tracer.trace_id)
 
-        instance = WorkflowInstance(
+        init_kwargs: dict = dict(
             workflow_name=definition.name,
             status=WorkflowStatus.RUNNING,
             steps={s.id: StepState(step_id=s.id) for s in definition.steps},
         )
+        if instance_id:
+            init_kwargs["instance_id"] = instance_id
+        instance = WorkflowInstance(**init_kwargs)
         logger.info(
             "Workflow started",
             extra={"workflow": definition.name, "instance_id": instance.instance_id},
