@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from core.agent import Agent
+from core.event_bus import EventBus
 from core.logging_config import set_trace_id
 from core.state import StepState, StepStatus, WorkflowInstance, WorkflowStatus
 from core.tracer import Tracer
@@ -38,10 +39,12 @@ class WorkflowRunner:
         registry: ToolRegistry,
         store: WorkflowStore | None = None,
         tracer: Tracer | None = None,
+        event_bus: EventBus | None = None,
     ):
         self.registry = registry
         self.store = store
         self.tracer = tracer
+        self.event_bus = event_bus
 
     # ── Public API ───────────────────────────────────────────────────────────
 
@@ -164,6 +167,8 @@ class WorkflowRunner:
     async def _checkpoint(self, instance: WorkflowInstance) -> None:
         if self.store:
             await self.store.save(instance)
+        if self.event_bus:
+            await self.event_bus.publish(instance.instance_id, _make_event(instance))
 
     # ── Step execution ───────────────────────────────────────────────────────
 
@@ -355,3 +360,23 @@ class WorkflowRunner:
             return [self._resolve(v, instance) for v in value]
 
         return value
+
+
+# ── Module-level helpers ──────────────────────────────────────────────────────
+
+def _make_event(instance: WorkflowInstance) -> dict:
+    """Serialise a WorkflowInstance into an SSE-friendly dict."""
+    return {
+        "type": "state_change",
+        "instance_id": instance.instance_id,
+        "status": instance.status.value,
+        "steps": {
+            sid: {
+                "status": s.status.value,
+                "output": s.output,
+                "error": s.error,
+            }
+            for sid, s in instance.steps.items()
+        },
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }

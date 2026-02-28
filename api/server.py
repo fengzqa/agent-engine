@@ -1,10 +1,13 @@
 """FastAPI service layer for Agent Engine."""
 
 import asyncio
+import json
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 
 from api.models import (
     ChatRequest,
@@ -16,6 +19,7 @@ from api.models import (
     ScheduleResponse,
 )
 from core.agent import Agent
+from core.event_bus import EventBus
 from core.state import WorkflowInstance, WorkflowStatus
 from scheduler.models import ScheduleRecord
 from scheduler.schedule_store import ScheduleStore
@@ -23,7 +27,7 @@ from scheduler.workflow_scheduler import WorkflowScheduler
 from store.workflow_store import WorkflowStore
 from tools.builtin.common import HttpRequestTool, ReadFileTool, RunPythonTool, WriteFileTool
 from tools.registry import ToolRegistry
-from workflow.runner import WorkflowRunner
+from workflow.runner import WorkflowRunner, _make_event
 
 logger = logging.getLogger(__name__)
 
@@ -33,13 +37,14 @@ logger = logging.getLogger(__name__)
 
 _store = WorkflowStore()
 _schedule_store = ScheduleStore()
+_event_bus = EventBus()
 _tool_registry = ToolRegistry()
 _tool_registry.register(HttpRequestTool())
 _tool_registry.register(RunPythonTool())
 _tool_registry.register(ReadFileTool())
 _tool_registry.register(WriteFileTool())
 
-_runner = WorkflowRunner(_tool_registry, store=_store)
+_runner = WorkflowRunner(_tool_registry, store=_store, event_bus=_event_bus)
 _scheduler = WorkflowScheduler(_runner, _schedule_store, _store)
 
 
@@ -63,7 +68,7 @@ app = FastAPI(
 # ── Background helpers ────────────────────────────────────────────────────────
 
 async def _run_workflow_bg(definition, instance_id: str) -> None:
-    runner = WorkflowRunner(_tool_registry, store=_store)
+    runner = WorkflowRunner(_tool_registry, store=_store, event_bus=_event_bus)
     try:
         await runner.run(definition, instance_id=instance_id)
     except Exception as e:
@@ -71,7 +76,7 @@ async def _run_workflow_bg(definition, instance_id: str) -> None:
 
 
 async def _resume_workflow_bg(instance_id: str, definition, retry_failed: bool) -> None:
-    runner = WorkflowRunner(_tool_registry, store=_store)
+    runner = WorkflowRunner(_tool_registry, store=_store, event_bus=_event_bus)
     try:
         await runner.resume(instance_id, definition, retry_failed=retry_failed)
     except Exception as e:
@@ -148,6 +153,50 @@ async def delete_workflow(instance_id: str):
     except KeyError:
         raise HTTPException(404, detail=f"Instance '{instance_id}' not found")
     await _store.delete(instance_id)
+
+
+_SSE_TERMINAL = {"completed", "failed"}
+_SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+
+
+@app.get("/workflows/{instance_id}/stream")
+async def stream_workflow(instance_id: str):
+    """Stream live workflow state changes as Server-Sent Events.
+
+    Immediately sends the current snapshot, then pushes every subsequent
+    state change until the workflow reaches a terminal status or the client
+    disconnects.  Each event is a JSON-encoded state dict on a ``data:`` line.
+    A comment line (``: heartbeat``) is sent every 30 s to keep the connection alive.
+    """
+    try:
+        instance = await _store.load(instance_id)
+    except KeyError:
+        raise HTTPException(404, detail=f"Instance '{instance_id}' not found")
+
+    async def generator():
+        # ── 1. Send current snapshot ──────────────────────────────────────
+        snapshot = _make_event(instance)
+        yield f"data: {json.dumps(snapshot)}\n\n"
+        if snapshot["status"] in _SSE_TERMINAL:
+            return
+
+        # ── 2. Subscribe and forward subsequent events ────────────────────
+        q = _event_bus.subscribe(instance_id)
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=30.0)
+                    yield f"data: {json.dumps(event)}\n\n"
+                    if event.get("status") in _SSE_TERMINAL:
+                        return
+                except asyncio.TimeoutError:
+                    yield ": heartbeat\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            _event_bus.unsubscribe(instance_id, q)
+
+    return StreamingResponse(generator(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
 
 @app.post("/agent/chat", response_model=ChatResponse)
