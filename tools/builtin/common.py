@@ -55,7 +55,21 @@ class HttpRequestTool(BaseTool):
 
 class RunPythonTool(BaseTool):
     name = "run_python"
-    description = "Execute a Python code snippet and return stdout/stderr."
+    description = (
+        "Execute a Python code snippet. "
+        "If the snippet assigns a variable named `result`, that value is returned "
+        "as the step output (JSON-serialisable). "
+        "Otherwise the output is {\"stdout\": ..., \"stderr\": ...}."
+    )
+
+    # Appended to user code to serialise `result` → temp file
+    _CAPTURE = (
+        "\nimport json as __j, sys as __sys, pathlib as __pl\n"
+        "try:\n"
+        "    __pl.Path(__sys.argv[1]).write_text(__j.dumps(result))\n"
+        "except NameError:\n"
+        "    pass\n"
+    )
 
     def input_schema(self) -> dict:
         return {
@@ -68,25 +82,35 @@ class RunPythonTool(BaseTool):
 
     async def execute(self, code: str) -> ToolResult:
         with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
-            f.write(code)
+            f.write(code + self._CAPTURE)
             tmp_path = f.name
+        result_path = tmp_path + ".result.json"
         try:
-            result = await asyncio.to_thread(
+            proc = await asyncio.to_thread(
                 subprocess.run,
-                ["python", tmp_path],
+                ["python", tmp_path, result_path],
                 capture_output=True,
                 text=True,
                 timeout=30,
             )
-            return ToolResult(
-                success=result.returncode == 0,
-                output={"stdout": result.stdout, "stderr": result.stderr},
-                error=result.stderr if result.returncode != 0 else None,
-            )
+            if proc.returncode != 0:
+                return ToolResult(
+                    success=False,
+                    output={"stdout": proc.stdout, "stderr": proc.stderr},
+                    error=proc.stderr or proc.stdout,
+                )
+            result_file = Path(result_path)
+            if result_file.exists():
+                import json as _json
+                output = _json.loads(result_file.read_text())
+            else:
+                output = {"stdout": proc.stdout, "stderr": proc.stderr}
+            return ToolResult(success=True, output=output)
         except subprocess.TimeoutExpired:
             return ToolResult(success=False, output=None, error="Execution timed out (30s)")
         finally:
             Path(tmp_path).unlink(missing_ok=True)
+            Path(result_path).unlink(missing_ok=True)
 
 
 class ReadFileTool(BaseTool):

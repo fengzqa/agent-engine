@@ -1,14 +1,21 @@
 """Workflow DSL — define workflows as typed step graphs."""
 
+from __future__ import annotations
+
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, model_validator
 
+if TYPE_CHECKING:
+    pass
+
 
 class StepType(str, Enum):
-    TOOL = "tool"   # call a registered tool directly
-    LLM  = "llm"   # invoke the Agent with a prompt (may use tools internally)
+    TOOL = "tool"         # call a registered tool directly
+    LLM  = "llm"         # invoke the Agent with a prompt (may use tools internally)
+    SUBWORKFLOW = "subworkflow"  # run a nested WorkflowDefinition as a single step
+    MAP  = "map"          # fan-out: apply a step template to each item in a list
 
 
 class StepDefinition(BaseModel):
@@ -22,6 +29,14 @@ class StepDefinition(BaseModel):
 
     # LLM step fields
     prompt: str | None = None
+
+    # SUBWORKFLOW step fields
+    # Forward reference resolved after WorkflowDefinition is declared.
+    sub_workflow: Any | None = None  # WorkflowDefinition | None
+
+    # MAP step fields
+    map_input: str | None = None     # template string resolving to a list
+    map_step: StepDefinition | None = None  # step template applied to each item
 
     # Execution control
     depends_on: list[str] = []
@@ -40,6 +55,15 @@ class StepDefinition(BaseModel):
             raise ValueError(f"Step '{self.id}': TOOL steps must set 'tool'")
         if self.type == StepType.LLM and not self.prompt:
             raise ValueError(f"Step '{self.id}': LLM steps must set 'prompt'")
+        if self.type == StepType.SUBWORKFLOW and self.sub_workflow is None:
+            raise ValueError(f"Step '{self.id}': SUBWORKFLOW steps must set 'sub_workflow'")
+        if self.type == StepType.MAP:
+            if not self.map_input:
+                raise ValueError(f"Step '{self.id}': MAP steps must set 'map_input'")
+            if self.map_step is None:
+                raise ValueError(f"Step '{self.id}': MAP steps must set 'map_step'")
+            if self.map_step.id == "item":
+                raise ValueError(f"Step '{self.id}': map_step id 'item' is reserved")
         return self
 
 
@@ -77,3 +101,7 @@ class WorkflowDefinition(BaseModel):
                     if in_degree[s.id] == 0:
                         queue.append(s.id)
         return visited != len(self.steps)
+
+
+# Resolve forward references so Pydantic can fully validate recursive types.
+StepDefinition.model_rebuild()

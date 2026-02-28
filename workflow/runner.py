@@ -263,7 +263,74 @@ class WorkflowRunner:
             agent = Agent(registry=self.registry, tracer=tracer)
             return await agent.run(resolved_prompt)
 
+        if step.type == StepType.SUBWORKFLOW:
+            return await self._run_subworkflow(step.sub_workflow, tracer)
+
+        if step.type == StepType.MAP:
+            return await self._run_map(instance, step, tracer)
+
         raise ValueError(f"Unknown step type: {step.type}")
+
+    async def _run_subworkflow(
+        self,
+        sub_def: WorkflowDefinition,
+        tracer: Tracer,
+    ) -> dict:
+        """Execute a nested workflow in-memory and return its step outputs."""
+        sub_runner = WorkflowRunner(self.registry, tracer=tracer)
+        sub_instance, _ = await sub_runner.run(sub_def)
+        if sub_instance.status.value == "failed":
+            failed = {
+                sid: s.error
+                for sid, s in sub_instance.steps.items()
+                if s.status.value == "failed"
+            }
+            raise RuntimeError(f"Sub-workflow '{sub_def.name}' failed: {failed}")
+        return {sid: s.output for sid, s in sub_instance.steps.items()}
+
+    async def _run_map(
+        self,
+        instance: WorkflowInstance,
+        step: StepDefinition,
+        tracer: Tracer,
+    ) -> list:
+        """Fan-out: run map_step for each item in the resolved list, in parallel."""
+        raw = self._resolve(step.map_input, instance)
+        if isinstance(raw, str):
+            import json as _json
+            items = _json.loads(raw)
+        else:
+            items = raw
+        if not isinstance(items, list):
+            raise ValueError(
+                f"MAP step '{step.id}': map_input must resolve to a list, got {type(items).__name__}"
+            )
+
+        async def run_item(item: Any) -> Any:
+            # Build a temporary WorkflowInstance that includes:
+            # - parent step outputs (for cross-referencing with {{parent_step.output}})
+            # - a synthetic "item" step whose output is the current element
+            item_steps: dict[str, StepState] = {**instance.steps}
+            item_steps["item"] = StepState(
+                step_id="item",
+                status=StepStatus.COMPLETED,
+                output=item,
+            )
+            item_steps[step.map_step.id] = StepState(step_id=step.map_step.id)
+            temp = WorkflowInstance(
+                workflow_name=f"{instance.workflow_name}.__map__",
+                status=WorkflowStatus.RUNNING,
+                steps=item_steps,
+            )
+            await self._execute_step(temp, step.map_step, tracer)
+            result_state = temp.steps[step.map_step.id]
+            if result_state.status.value == "failed":
+                raise RuntimeError(
+                    f"MAP step '{step.id}' item failed: {result_state.error}"
+                )
+            return result_state.output
+
+        return list(await asyncio.gather(*[run_item(item) for item in items]))
 
     # ── Expression evaluation ────────────────────────────────────────────────
 
